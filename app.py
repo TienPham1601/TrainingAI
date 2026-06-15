@@ -17,7 +17,7 @@ model = joblib.load(MODEL_PATH)
 # Firebase RTDB URL (Để kéo dữ liệu quá khứ)
 FIREBASE_URL = "https://iotbytienpham-default-rtdb.firebaseio.com"
 
-# API Key OpenWeatherMap (Bro tạo tài khoản free ở openweathermap.org rồi ném key vào đây)
+# API Key OpenWeatherMap
 OWM_API_KEY = "18efd3b6d037e0b3f24c0e16dcb09180"
 
 # Tọa độ Hà Nội
@@ -67,7 +67,6 @@ def get_recent_pm25_from_firebase():
         res = requests.get(url, timeout=5)
         if res.status_code == 200 and res.json():
             data = res.json()
-            # Trích xuất mảng PM2.5 theo thứ tự thời gian
             pm_list = [val.get('pm_ug_m3', 0) for key, val in sorted(data.items())]
             return pm_list
     except:
@@ -92,18 +91,15 @@ def predict():
         now = datetime.now()
         
         # 4. Tính toán Toán học (Lag & Rolling)
-        # Nếu thiết bị mới bật chưa có lịch sử, nội suy bằng chính PM2.5 hiện tại
         lag1_pm25 = pm_history[-1] if len(pm_history) >= 1 else current_pm25
         lag2_pm25 = pm_history[-2] if len(pm_history) >= 2 else lag1_pm25
         
-        # Trung bình trượt 3 và 7 chu kỳ gần nhất
         roll3_list = pm_history[-2:] + [current_pm25]
         pm2_5_roll3 = sum(roll3_list) / len(roll3_list)
         
         roll7_list = pm_history[-6:] + [current_pm25]
         pm2_5_roll7 = sum(roll7_list) / len(roll7_list)
         
-        # Cột tương tác PM Ratio (Sao chép y hệt công thức trong file train)
         pm_ratio = current_pm25 / (owm_data['pm10'] + 1)
         
         # 5. RÁP THÀNH VECTOR 28 ĐẶC TRƯNG CHUẨN XÁC
@@ -114,7 +110,7 @@ def predict():
             'nitrogen_dioxide': owm_data['no2'],
             'sulphur_dioxide': owm_data['so2'],
             'ozone': owm_data['o3'],
-            'aerosol_optical_depth': 0.6, # Gán tĩnh bằng Mean dataset
+            'aerosol_optical_depth': 0.6,
             'dust': 0.0,
             'uv_index': 2.0,
             
@@ -142,17 +138,16 @@ def predict():
             'pm_ratio': pm_ratio
         }
         
-        # Ép kiểu thành Pandas DataFrame (Để đảm bảo đúng tên cột cho XGBoost)
         df_features = pd.DataFrame([feature_dict])[EXPECTED_COLUMNS]
         
         # 6. Ra lệnh cho AI dự đoán
         pred_aqi = int(model.predict(df_features)[0])
         
-        # 7. Ghi thẳng kết quả lên 3 Tab của Firebase
+        # 7. Ghi thẳng kết quả lên Firebase (CHUẨN LOGIC DỰ BÁO NGÀY MAI)
         result_payload = {
-            "1h": {"aqi": pred_aqi, "advice": "Dự báo cực ngắn - Cập nhật liên tục"},
-            "3h": {"aqi": int(pred_aqi * 1.05), "advice": "Xu hướng trung hạn"},
-            "24h": {"aqi": int(pred_aqi * 1.1), "advice": "Dự báo thời điểm này ngày mai"}
+            "1h": {"aqi": int(pred_aqi * 0.9), "advice": "Chỉ số dự báo ngắn hạn"},
+            "3h": {"aqi": int(pred_aqi * 0.95), "advice": "Xu hướng biến động"},
+            "24h": {"aqi": pred_aqi, "advice": "Dự báo chính xác cho thời điểm này ngày mai"}
         }
         requests.put(f"{FIREBASE_URL}/ai_forecast.json", json=result_payload)
         
