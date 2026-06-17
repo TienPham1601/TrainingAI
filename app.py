@@ -1,4 +1,3 @@
-cat > /mnt/user-data/outputs/render_server/main.py << 'ENDOFFILE'
 import os, time, requests, joblib, pandas as pd
 from datetime import datetime, timedelta
 from flask import Flask, request, jsonify
