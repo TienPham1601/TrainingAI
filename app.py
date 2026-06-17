@@ -7,6 +7,7 @@ app = Flask(__name__)
 # ── Config ────────────────────────────────────────────────────────────────────
 model        = joblib.load('aqi_model.pkl')
 FIREBASE_URL = "https://iotbytienpham-default-rtdb.firebaseio.com"
+FIREBASE_AUTH= "BaP7SSMKkNLJkVFFcXpqYPJOpKQBWFnNknESzsoH" # Đã thêm khóa bảo mật
 OWM_KEY      = "18efd3b6d037e0b3f24c0e16dcb09180"
 AQICN_TOKEN  = "a63cb2de5e93820f8a97c997d0e650dcad7d6aea"
 LAT, LON     = 21.0285, 105.8542
@@ -89,7 +90,8 @@ def get_daily_pm25_history():
     for days_ago in range(3, 0, -1):
         ds = (datetime.now()-timedelta(days=days_ago)).strftime("%Y-%m-%d")
         try:
-            r = requests.get(f"{FIREBASE_URL}/sensor_data/esp32_01/{ds}.json", timeout=5)
+            # Đã gắn thẻ Auth vào đường link GET
+            r = requests.get(f"{FIREBASE_URL}/sensor_data/esp32_01/{ds}.json?auth={FIREBASE_AUTH}", timeout=5)
             if r.status_code == 200 and r.json():
                 data = r.json()
                 lk   = sorted(data.keys())[-1]
@@ -213,7 +215,8 @@ def get_or_refresh_forecast():
         _forecast_cache = build_7day_forecast()
         _forecast_time  = now
         try:
-            requests.put(f"{FIREBASE_URL}/weather_7day.json",
+            # Đã gắn thẻ Auth vào đường link PUT
+            requests.put(f"{FIREBASE_URL}/weather_7day.json?auth={FIREBASE_AUTH}",
                         json=_forecast_cache, timeout=5)
             print("[FIREBASE] /weather_7day updated OK")
         except Exception as e:
@@ -272,8 +275,8 @@ def predict():
         adv_local = get_advice(aqi_local)
         print(f"[LOCAL] AQI={aqi_local}")
 
-        # Ghi local prediction lên Firebase
-        requests.put(f"{FIREBASE_URL}/ai_forecast.json",
+        # Đã gắn thẻ Auth vào đường link PUT
+        requests.put(f"{FIREBASE_URL}/ai_forecast.json?auth={FIREBASE_AUTH}",
                     json={"local": {"aqi": aqi_local, "advice": adv_local}},
                     timeout=5)
 
