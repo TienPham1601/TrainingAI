@@ -1,294 +1,182 @@
-import os, time, requests, joblib, pandas as pd
+import os
+import requests
+import joblib
+import pandas as pd
 from datetime import datetime, timedelta
+import pytz
 from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
-# ── Config ────────────────────────────────────────────────────────────────────
+# ==============================================================================
+# ⚙️ CẤU HÌNH HỆ THỐNG (ĐÃ KHÓA CHẶT HÀ NỘI)
+# ==============================================================================
 model        = joblib.load('aqi_model.pkl')
 FIREBASE_URL = "https://iotbytienpham-default-rtdb.firebaseio.com"
-OWM_KEY      = "18efd3b6d037e0b3f24c0e16dcb09180"
+OWM_API_KEY  = "18efd3b6d037e0b3f24c0e16dcb09180" 
 AQICN_TOKEN  = "a63cb2de5e93820f8a97c997d0e650dcad7d6aea"
-LAT, LON     = 21.0285, 105.8542
+LAT, LON     = 21.0285, 105.8542 # Tọa độ chuẩn Hà Nội
+VN_TZ        = pytz.timezone('Asia/Ho_Chi_Minh') # Mã múi giờ GMT+7 chuẩn quốc tế của VN
 
-EXPECTED_COLUMNS = [
-    'pm10','pm2_5','carbon_monoxide','nitrogen_dioxide','sulphur_dioxide',
-    'ozone','aerosol_optical_depth','dust','uv_index',
-    'day','month','year','dayofweek',
-    'pm2_5_lag1','pm2_5_lag2','pm10_lag1','pm10_lag2',
-    'co_lag1','co_lag2','no2_lag1','no2_lag2',
-    'so2_lag1','so2_lag2','o3_lag1','o3_lag2',
-    'pm2_5_roll3','pm2_5_roll7','pm_ratio'
-]
+EXPECTED_COLUMNS = ['pm10', 'pm2_5', 'carbon_monoxide', 'nitrogen_dioxide', 'sulphur_dioxide', 'ozone', 'aerosol_optical_depth', 'dust', 'uv_index', 'day', 'month', 'year', 'dayofweek', 'pm2_5_lag1', 'pm2_5_lag2', 'pm10_lag1', 'pm10_lag2', 'co_lag1', 'co_lag2', 'no2_lag1', 'no2_lag2', 'so2_lag1', 'so2_lag2', 'o3_lag1', 'o3_lag2', 'pm2_5_roll3', 'pm2_5_roll7', 'pm_ratio']
+HANOI_AVG = {'pm10': 57.27, 'carbon_monoxide': 725.83, 'nitrogen_dioxide': 27.15, 'sulphur_dioxide': 25.71, 'ozone': 72.52, 'aerosol_optical_depth': 0.642, 'dust': 0.491, 'uv_index': 1.172}
 
-HANOI_AVG = {
-    'pm10':57.27,'carbon_monoxide':725.83,'nitrogen_dioxide':27.15,
-    'sulphur_dioxide':25.71,'ozone':72.52,
-    'aerosol_optical_depth':0.642,'dust':0.491,'uv_index':1.172,
-}
+# ==============================================================================
+# 📡 HÀM PHỤ TRỢ (HELPERS)
+# ==============================================================================
+def get_advice(aqi: int) -> str:
+    if aqi <= 50: return "✅ Tuyệt vời! Không khí trong lành, lý tưởng để hoạt động ngoài trời."
+    elif aqi <= 100: return "⚠️ Chấp nhận được. Nhóm người nhạy cảm nên cân nhắc nếu ở ngoài quá lâu."
+    elif aqi <= 150: return "😷 Kém. Trẻ em, người già và người có bệnh hô hấp cần hạn chế ra ngoài."
+    elif aqi <= 200: return "🚨 XẤU! Ảnh hưởng sức khỏe toàn dân. Bắt buộc đeo khẩu trang N95."
+    return "🔴 NGUY HIỂM! Mức báo động. Hãy ở trong nhà và bật máy lọc không khí."
 
-VN_DAYS = ['Thứ Hai','Thứ Ba','Thứ Tư','Thứ Năm','Thứ Sáu','Thứ Bảy','Chủ Nhật']
+def get_aqi_color(aqi: int) -> str:
+    if aqi <= 50: return "#15803d" # Xanh lá
+    elif aqi <= 100: return "#b45309" # Vàng
+    elif aqi <= 150: return "#c2410c" # Cam
+    elif aqi <= 200: return "#dc2626" # Đỏ
+    return "#7c3aed" # Tím
 
-WEATHER_EMOJI = {
-    '01':'☀️','02':'⛅','03':'🌥️','04':'☁️',
-    '09':'🌧️','10':'🌦️','11':'⛈️','13':'❄️','50':'🌫️'
-}
-
-# Cache 7-day forecast (update mỗi giờ)
-_forecast_cache = None
-_forecast_time  = 0
-
-# ── Helpers ───────────────────────────────────────────────────────────────────
-def pm25_to_aqi(pm25):
-    bps = [(0,12,0,50),(12.1,35.4,51,100),(35.5,55.4,101,150),
-           (55.5,150.4,151,200),(150.5,250.4,201,300),
-           (250.5,350.4,301,400),(350.5,500.4,401,500)]
-    for lo,hi,alo,ahi in bps:
-        if lo <= pm25 <= hi:
-            return int(round((ahi-alo)/(hi-lo)*(pm25-lo)+alo))
-    return 500
-
-def aqi_level_info(aqi):
-    if aqi <= 50:  return ('Tốt',       '#15803d')
-    if aqi <= 100: return ('Trung bình', '#b45309')
-    if aqi <= 150: return ('Kém',        '#c2410c')
-    if aqi <= 200: return ('Xấu',        '#dc2626')
-    if aqi <= 300: return ('Rất xấu',    '#7c3aed')
-    return                ('Nguy hiểm',  '#1e1b4b')
-
-def w_emoji(icon): return WEATHER_EMOJI.get(icon[:2], '🌤️')
-
-def get_advice(aqi):
-    if aqi <= 50:  return "Không khí trong lành, yên tâm hoạt động ngoài trời"
-    if aqi <= 100: return "Chấp nhận được, nhóm nhạy cảm nên hạn chế ra ngoài"
-    if aqi <= 150: return "Nhóm nhạy cảm (trẻ em, người già) nên ở trong nhà"
-    if aqi <= 200: return "Ảnh hưởng sức khỏe rõ rệt, hạn chế hoạt động ngoài"
-    if aqi <= 300: return "Cảnh báo khẩn, đeo khẩu trang N95 nếu buộc ra ngoài"
-    return "Nguy hiểm! Tuyệt đối ở trong nhà, đóng kín cửa"
-
-# ── Data sources ──────────────────────────────────────────────────────────────
+# ==============================================================================
+# 📡 KÉO DỮ LIỆU ĐẦU VÀO CHO AI XGBOOST (NODE LOCAL)
+# ==============================================================================
 def get_owm_current():
+    """Kéo dữ liệu khí tượng OWM để bổ sung Features cho model (Vì Sharp chỉ đo được PM2.5)"""
     try:
-        r = requests.get(
-            f"http://api.openweathermap.org/data/2.5/air_pollution?lat={LAT}&lon={LON}&appid={OWM_KEY}",
-            timeout=5)
-        if r.status_code == 200:
-            c = r.json()['list'][0]['components']
-            return {'pm10':c.get('pm10',HANOI_AVG['pm10']),
-                    'co':  c.get('co',  HANOI_AVG['carbon_monoxide']),
-                    'no2': c.get('no2', HANOI_AVG['nitrogen_dioxide']),
-                    'so2': c.get('so2', HANOI_AVG['sulphur_dioxide']),
-                    'o3':  c.get('o3',  HANOI_AVG['ozone'])}
-    except Exception as e: print(f"[WARN] OWM current: {e}")
-    return {'pm10':HANOI_AVG['pm10'],'co':HANOI_AVG['carbon_monoxide'],
-            'no2':HANOI_AVG['nitrogen_dioxide'],'so2':HANOI_AVG['sulphur_dioxide'],
-            'o3':HANOI_AVG['ozone']}
+        res = requests.get(f"http://api.openweathermap.org/data/2.5/air_pollution?lat={LAT}&lon={LON}&appid={OWM_API_KEY}", timeout=5).json()
+        c = res['list'][0]['components']
+        return {'pm10': c.get('pm10', HANOI_AVG['pm10']), 'co': c.get('co', HANOI_AVG['carbon_monoxide']), 'no2': c.get('no2', HANOI_AVG['nitrogen_dioxide']), 'so2': c.get('so2', HANOI_AVG['sulphur_dioxide']), 'o3': c.get('o3', HANOI_AVG['ozone'])}
+    except:
+        return {'pm10': HANOI_AVG['pm10'], 'co': HANOI_AVG['carbon_monoxide'], 'no2': HANOI_AVG['nitrogen_dioxide'], 'so2': HANOI_AVG['sulphur_dioxide'], 'o3': HANOI_AVG['ozone']}
 
 def get_daily_pm25_history():
+    """Lấy PM2.5 của 3 ngày gần nhất từ Firebase để tạo Lag/Roll cho Model"""
     pm_list = []
     for days_ago in range(3, 0, -1):
-        ds = (datetime.now()-timedelta(days=days_ago)).strftime("%Y-%m-%d")
+        date_str = (datetime.now(VN_TZ) - timedelta(days=days_ago)).strftime("%Y-%m-%d")
+        url = f"{FIREBASE_URL}/sensor_data/esp32_01/{date_str}.json"
         try:
-            r = requests.get(f"{FIREBASE_URL}/sensor_data/esp32_01/{ds}.json", timeout=5)
-            if r.status_code == 200 and r.json():
-                data = r.json()
-                lk   = sorted(data.keys())[-1]
-                pm   = float(data[lk].get('pm_ug_m3', 0))
-                if pm > 0: pm_list.append(pm)
+            res = requests.get(url, timeout=5)
+            if res.status_code == 200 and res.json():
+                data = res.json()
+                last_k = sorted(data.keys())[-1]
+                pm_val = float(data[last_k].get('pm_ug_m3', 0))
+                if pm_val > 0: pm_list.append(pm_val)
         except: pass
     return pm_list
 
-def get_aqicn_data():
-    """Lấy AQI hiện tại + 7-day PM2.5 forecast từ AQICN (trạm đo thực tế Hà Nội)."""
-    try:
-        r = requests.get(
-            f"https://api.waqi.info/feed/hanoi/?token={AQICN_TOKEN}",
-            timeout=8)
-        if r.status_code == 200:
-            d = r.json()
-            if d['status'] == 'ok':
-                current_aqi   = int(d['data']['aqi'])
-                forecast_pm25 = []
-                if 'forecast' in d['data'] and 'daily' in d['data']['forecast']:
-                    forecast_pm25 = d['data']['forecast']['daily'].get('pm25', [])
-                print(f"[AQICN] Current AQI={current_aqi}, forecast days={len(forecast_pm25)}")
-                return current_aqi, forecast_pm25
-    except Exception as e: print(f"[WARN] AQICN: {e}")
-    return None, []
-
-def get_owm_weather_forecast():
-    """OWM 5-day forecast, aggregate theo ngày (UTC+7)."""
-    try:
-        r = requests.get(
-            f"https://api.openweathermap.org/data/2.5/forecast?lat={LAT}&lon={LON}&appid={OWM_KEY}&units=metric",
-            timeout=5)
-        if r.status_code == 200:
-            by_date = {}
-            for e in r.json()['list']:
-                dt_local = datetime.utcfromtimestamp(e['dt']) + timedelta(hours=7)
-                dk = dt_local.strftime('%Y-%m-%d')
-                by_date.setdefault(dk, []).append(e)
-            result = {}
-            for dk, entries in by_date.items():
-                temps  = [e['main']['temp']     for e in entries]
-                humids = [e['main']['humidity']  for e in entries]
-                mid    = next(
-                    (e for e in entries
-                     if '11' <= (datetime.utcfromtimestamp(e['dt'])+timedelta(hours=7)).strftime('%H') < '14'),
-                    entries[len(entries)//2])
-                result[dk] = {
-                    'temp_max': round(max(temps)),
-                    'temp_min': round(min(temps)),
-                    'humidity': round(sum(humids)/len(humids)),
-                    'emoji':    w_emoji(mid['weather'][0]['icon']),
-                    'desc':     mid['weather'][0]['description'].capitalize(),
-                }
-            return result
-    except Exception as e: print(f"[WARN] OWM weather: {e}")
-    return {}
-
-def build_7day_forecast():
-    """Kết hợp AQICN (AQI chính xác) + OWM (nhiệt độ, thời tiết)."""
-    current_aqi, aqicn_pm25 = get_aqicn_data()
-    owm_weather = get_owm_weather_forecast()
-
-    today = datetime.now().date()
-
-    # Map ngày → PM2.5 avg từ AQICN
-    aqicn_map = {}
-    for entry in aqicn_pm25:
-        try: aqicn_map[entry['day']] = float(entry['avg'])
-        except: pass
-
-    days = []
-    for i in range(7):
-        d     = today + timedelta(days=i)
-        d_str = d.strftime('%Y-%m-%d')
-
-        # AQI: dùng AQICN hiện tại cho hôm nay, forecast cho các ngày sau
-        if i == 0 and current_aqi:
-            aqi = current_aqi
-        elif d_str in aqicn_map:
-            aqi = pm25_to_aqi(aqicn_map[d_str])
-        else:
-            aqi = 0
-
-        level, color = aqi_level_info(aqi) if aqi > 0 else ('N/A', '#64748b')
-        w = owm_weather.get(d_str, {})
-
-        if i == 0:   day_label = 'Hôm nay'
-        elif i == 1: day_label = 'Ngày mai'
-        else:        day_label = VN_DAYS[d.weekday()]
-
-        days.append({
-            'date':       d_str,
-            'day_label':  day_label,
-            'date_label': d.strftime('%d/%m'),
-            'weekday':    VN_DAYS[d.weekday()],
-            'is_today':   i == 0,
-            'is_tomorrow':i == 1,
-            'aqi':        aqi,
-            'aqi_label':  level,
-            'aqi_color':  color,
-            'pm25':       round(aqicn_map.get(d_str, 0), 1),
-            'temp_max':   w.get('temp_max', '--'),
-            'temp_min':   w.get('temp_min', '--'),
-            'humidity':   w.get('humidity', '--'),
-            'emoji':      w.get('emoji', '🌤️'),
-            'desc':       w.get('desc', ''),
-        })
-
-    return {
-        'updated':          datetime.now().strftime('%d/%m/%Y %H:%M'),
-        'hanoi_current_aqi':current_aqi or 0,
-        'days':             days,
-    }
-
-def get_or_refresh_forecast():
-    """Cache 7-day forecast, chỉ rebuild mỗi 1 tiếng."""
-    global _forecast_cache, _forecast_time
-    now = time.time()
-    if _forecast_cache is None or (now - _forecast_time) > 3600:
-        print("[FORECAST] Refreshing 7-day forecast...")
-        _forecast_cache = build_7day_forecast()
-        _forecast_time  = now
-        try:
-            requests.put(f"{FIREBASE_URL}/weather_7day.json",
-                        json=_forecast_cache, timeout=5)
-            print("[FIREBASE] /weather_7day updated OK")
-        except Exception as e:
-            print(f"[WARN] Firebase weather write: {e}")
-    return _forecast_cache
-
 def build_features(pm2_5, owm, history, target_date):
-    h    = history + [pm2_5]
-    lag1 = history[-1] if history else pm2_5
+    """Lắp ráp mảng 28 Tính năng chuẩn cấu trúc XGBoost lúc Train"""
+    history_all = history + [pm2_5]
+    lag1 = history[-1] if len(history) >= 1 else pm2_5
     lag2 = history[-2] if len(history) >= 2 else lag1
-    r3   = sum(h[-3:])/len(h[-3:]) if h else pm2_5
-    r7   = sum(h[-7:])/len(h[-7:]) if h else pm2_5
+    
+    roll3_vals = history_all[-3:] if len(history_all) >=3 else [pm2_5]*3
+    roll7_vals = history_all[-7:] if len(history_all) >=7 else [pm2_5]*7
+    roll3 = sum(roll3_vals) / len(roll3_vals)
+    roll7 = sum(roll7_vals) / len(roll7_vals)
+
     pm10 = owm.get('pm10', HANOI_AVG['pm10'])
     return {
-        'pm10':pm10,'pm2_5':pm2_5,
-        'carbon_monoxide':  owm.get('co',  HANOI_AVG['carbon_monoxide']),
-        'nitrogen_dioxide': owm.get('no2', HANOI_AVG['nitrogen_dioxide']),
-        'sulphur_dioxide':  owm.get('so2', HANOI_AVG['sulphur_dioxide']),
-        'ozone':            owm.get('o3',  HANOI_AVG['ozone']),
-        'aerosol_optical_depth':HANOI_AVG['aerosol_optical_depth'],
-        'dust':HANOI_AVG['dust'],'uv_index':HANOI_AVG['uv_index'],
-        'day':target_date.day,'month':target_date.month,
-        'year':target_date.year,'dayofweek':target_date.weekday(),
-        'pm2_5_lag1':lag1,'pm2_5_lag2':lag2,
-        'pm10_lag1':pm10,'pm10_lag2':pm10,
-        'co_lag1':owm.get('co',HANOI_AVG['carbon_monoxide']),
-        'co_lag2':owm.get('co',HANOI_AVG['carbon_monoxide']),
-        'no2_lag1':owm.get('no2',HANOI_AVG['nitrogen_dioxide']),
-        'no2_lag2':owm.get('no2',HANOI_AVG['nitrogen_dioxide']),
-        'so2_lag1':owm.get('so2',HANOI_AVG['sulphur_dioxide']),
-        'so2_lag2':owm.get('so2',HANOI_AVG['sulphur_dioxide']),
-        'o3_lag1':owm.get('o3',HANOI_AVG['ozone']),
-        'o3_lag2':owm.get('o3',HANOI_AVG['ozone']),
-        'pm2_5_roll3':r3,'pm2_5_roll7':r7,
-        'pm_ratio':pm2_5/(pm10+1),
+        'pm10': pm10, 'pm2_5': pm2_5,
+        'carbon_monoxide': owm['co'], 'nitrogen_dioxide': owm['no2'], 'sulphur_dioxide': owm['so2'], 'ozone': owm['o3'],
+        'aerosol_optical_depth': HANOI_AVG['aerosol_optical_depth'], 'dust': HANOI_AVG['dust'], 'uv_index': HANOI_AVG['uv_index'],
+        'day': target_date.day, 'month': target_date.month, 'year': target_date.year, 'dayofweek': target_date.weekday(),
+        'pm2_5_lag1': lag1, 'pm2_5_lag2': lag2, 'pm10_lag1': pm10, 'pm10_lag2': pm10,
+        'co_lag1': owm['co'], 'co_lag2': owm['co'], 'no2_lag1': owm['no2'], 'no2_lag2': owm['no2'],
+        'so2_lag1': owm['so2'], 'so2_lag2': owm['so2'], 'o3_lag1': owm['o3'], 'o3_lag2': owm['o3'],
+        'pm2_5_roll3': roll3, 'pm2_5_roll7': roll7, 'pm_ratio': pm2_5 / (pm10 + 1)
     }
 
-# ── Routes ────────────────────────────────────────────────────────────────────
+# ==============================================================================
+# 🧠 API ENDPOINT CHÍNH (ĐƯỢC GỌI TỪ ESP32 GATEWAY)
+# ==============================================================================
 @app.route('/predict', methods=['POST'])
 def predict():
     try:
-        current_pm25 = float((request.json or {}).get('pm25', 0))
-        if current_pm25 <= 0:
-            return jsonify({'error': 'PM2.5 không hợp lệ'}), 400
+        req_data = request.json or {}
+        current_pm25 = float(req_data.get('pm25', 0))
+        if current_pm25 <= 0: return jsonify({'error': 'Invalid PM2.5'}), 400
 
-        print(f"\n[REQUEST] PM2.5={current_pm25}")
+        print(f"\n[AI] Nhận Sensor PM2.5 từ ESP32 = {current_pm25}")
+        today_vn = datetime.now(VN_TZ)
 
-        owm     = get_owm_current()
-        history = get_daily_pm25_history()
-        today   = datetime.now()
+        # ── 1. DỰ BÁO AI XGBOOST (CHO TRẠM LOCAL CỦA BẠN) ──
+        owm_current = get_owm_current()
+        history     = get_daily_pm25_history()
+        feats_local = build_features(current_pm25, owm_current, history, today_vn)
+        
+        df_local    = pd.DataFrame([feats_local])[EXPECTED_COLUMNS]
+        aqi_local   = int(max(0, min(500, round(float(model.predict(df_local)[0])))))
+        adv_local   = get_advice(aqi_local)
 
-        # XGBoost dự đoán AQI tại vị trí sensor
-        feats     = build_features(current_pm25, owm, history, today)
-        df        = pd.DataFrame([feats])[EXPECTED_COLUMNS]
-        aqi_local = int(max(0, min(500, round(float(model.predict(df)[0])))))
-        adv_local = get_advice(aqi_local)
-        print(f"[LOCAL] AQI={aqi_local}")
+        # ── 2. LẤY SỐ LIỆU AQICN CHUẨN (HÀ NỘI & 7 NGÀY TỚI) ──
+        # Lưu ý: Không dùng AI cho đoạn này, kéo data thực tế chuẩn quốc gia!
+        resp_aqicn = requests.get(f"https://api.waqi.info/feed/hanoi/?token={AQICN_TOKEN}", timeout=10).json()
+        days_list, hanoi_tomorrow = [], {}
+        
+        if resp_aqicn.get('status') == 'ok':
+            daily_pm25 = resp_aqicn['data']['forecast']['daily']['pm25']
+            daily_temp = resp_aqicn['data']['forecast']['daily'].get('t', []) 
+            temp_dict = {t['day']: t for t in daily_temp}
 
-        # Ghi local prediction lên Firebase
-        requests.put(f"{FIREBASE_URL}/ai_forecast.json",
-                    json={"local": {"aqi": aqi_local, "advice": adv_local}},
-                    timeout=5)
+            for item in daily_pm25:
+                date_str = item['day']
+                date_obj = datetime.strptime(date_str, "%Y-%m-%d").date()
+                if date_obj < today_vn.date(): continue # Bỏ qua ngày cũ
+                
+                aqi_val = int(item['avg'])
+                t_data = temp_dict.get(date_str, {})
+                
+                day_item = {
+                    "date_label": date_obj.strftime("%d/%m/%Y"), 
+                    "day_label": "Hôm nay" if date_obj == today_vn.date() else "Ngày mai" if date_obj == (today_vn + timedelta(days=1)).date() else date_obj.strftime("%A"),
+                    "is_today": date_obj == today_vn.date(),
+                    "is_tomorrow": date_obj == (today_vn + timedelta(days=1)).date(),
+                    "aqi": aqi_val,
+                    "aqi_color": get_aqi_color(aqi_val),
+                    "temp_max": int(t_data.get('max', 0)) if t_data else "--",
+                }
+                
+                vn_days = {"Monday":"Thứ 2", "Tuesday":"Thứ 3", "Wednesday":"Thứ 4", "Thursday":"Thứ 5", "Friday":"Thứ 6", "Saturday":"Thứ 7", "Sunday":"Chủ Nhật"}
+                if day_item['day_label'] in vn_days:
+                    day_item['day_label'] = vn_days[day_item['day_label']]
+                    
+                days_list.append(day_item)
+                
+                if day_item['is_tomorrow']: hanoi_tomorrow = day_item
 
-        # Refresh 7-day forecast nếu cache hết hạn
-        get_or_refresh_forecast()
+        # ── 3. ĐÓNG GÓI JSON ĐẨY LÊN FIREBASE (Web ESP32 sẽ kéo cục này về) ──
+        firebase_payload = {
+            "ai_forecast": {
+                "local": {
+                    "aqi": aqi_local,
+                    "color": get_aqi_color(aqi_local),
+                    "advice": adv_local
+                },
+                "hanoi_tomorrow": {
+                    "aqi": hanoi_tomorrow.get('aqi', '--'),
+                    "color": hanoi_tomorrow.get('aqi_color', '#64748b'),
+                    "date_label": hanoi_tomorrow.get('date_label', '--'),
+                    "advice": get_advice(hanoi_tomorrow.get('aqi', 0))
+                }
+            },
+            "weather_7day": {
+                "updated": today_vn.strftime("%H:%M:%S - %d/%m/%Y"),
+                "days": days_list[:7]
+            }
+        }
+        
+        fb_res = requests.patch(f"{FIREBASE_URL}/.json", json=firebase_payload, timeout=8)
+        print(f"[FIREBASE] Đã cập nhật AI Local và Forecast 7 ngày Hà Nội: HTTP {fb_res.status_code}")
 
-        return jsonify({'status': 'success', 'local_aqi': aqi_local})
+        return jsonify({'status': 'success'})
 
     except Exception as e:
         print(f"[ERROR] {e}")
         return jsonify({'error': str(e)}), 500
 
-@app.route('/health', methods=['GET'])
-def health():
-    return jsonify({'status': 'ok', 'time': datetime.now().isoformat()})
-
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 10000)))
+    port = int(os.environ.get('PORT', 10000))
+    app.run(host='0.0.0.0', port=port)
